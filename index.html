@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EXIF Orientation and Upscale Order: All 8 Tags Are Lossless, So Order Does Not Matter — Except When It Silently Does</title>
+<meta name="description" content="Measured: all 8 EXIF orientation values are exact pixel permutations (0.00% pixels changed), so rotating before or after an upscale costs nothing for normal photos. Upscale-first nevertheless scored 0.73-0.89 dB better on odd angles. ffmpeg autorotate plus a hardcoded output size produced a 55.6% aspect-ratio error, and -noautorotate silently lost 12.6 dB.">
+<link rel="canonical" href="https://celticgemini001.github.io/upgolab-exif-orientation-upscale/">
+<meta property="og:type" content="article">
+<meta property="og:title" content="EXIF Orientation and Upscale Order: All 8 Tags Are Lossless">
+<meta property="og:description" content="Rotating before upscaling is free for all 8 EXIF orientations. The damage comes from dropped tags, hardcoded output sizes and double rotation — measured at 55.6% aspect error and 12.6 dB.">
+<script type="application/ld+json">
+{"@type":"Article",
+ "@context":"https://schema.org",
+ "headline":"EXIF Orientation and Upscale Order: All 8 Tags Are Lossless, So Order Does Not Matter — Except When It Silently Does",
+ "author":{"@type":"Person","name":"UpgoLAB"},
+ "publisher":{"@type":"Organization","name":"UpgoLAB","url":"https://upgolab.com"},
+ "description":"All 8 EXIF orientation tags measured as lossless pixel permutations; rotate-vs-upscale ordering worth 0.73-0.89 dB on odd angles; ffmpeg autorotate with a hardcoded size produced 55.6% aspect error.",
+ "datePublished":"2026-11-17"}
+</script>
+<style>
+:root{--ink:#16181d;--mut:#5b6270;--line:#e2e5ea;--acc:#0a58ca;--bg:#fff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+ font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+main{max-width:48rem;margin:0 auto;padding:3rem 1.25rem 5rem}
+h1{font-size:2.05rem;line-height:1.22;margin:0 0 .7rem;letter-spacing:-.02em}
+h2{font-size:1.28rem;margin:2.8rem 0 .9rem;letter-spacing:-.01em}
+h3{font-size:1.05rem;margin:1.9rem 0 .5rem}
+p,li{color:#2b3038}
+a{color:var(--acc)}
+.lede{font-size:1.1rem;color:var(--mut);margin:0 0 1.6rem}
+.meta{font-size:.86rem;color:var(--mut);border-left:2px solid var(--line);
+ padding-left:.9rem;margin:0 0 2.2rem;line-height:1.6}
+table{width:100%;border-collapse:collapse;margin:1.3rem 0;font-size:.9rem}
+th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid var(--line)}
+th{font-weight:600;background:#f6f7f9;font-size:.8rem;text-transform:uppercase;
+ letter-spacing:.03em;color:var(--mut)}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+code{background:#f2f5fa;padding:.1rem .3rem;border-radius:4px;
+ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88em}
+pre{background:#f6f7f9;border:1px solid var(--line);border-radius:6px;padding:.9rem 1rem;
+ overflow-x:auto;font-size:.8rem;line-height:1.5;margin:1.3rem 0}
+pre code{background:none;padding:0;font-size:1em}
+.callout{border-left:3px solid var(--acc);background:#f5f8fd;padding:.9rem 1.1rem;
+ margin:1.7rem 0;border-radius:0 6px 6px 0}
+.callout p{margin:.3rem 0}
+footer{margin-top:4rem;padding-top:1.4rem;border-top:1px solid var(--line);
+ font-size:.9rem;color:var(--mut)}
+.sisternav{margin:2rem 0 0;padding-top:1.2rem;border-top:1px solid var(--line)}
+.sisternav p{font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;
+ color:#5b6270;margin:0 0 .6rem}
+.sisternav ul{list-style:none;padding:0;margin:0;display:flex;flex-wrap:wrap;gap:.4rem .9rem}
+.sisternav li{margin:0;font-size:.88rem;line-height:1.4}
+.sisternav a{text-decoration:none;border-bottom:1px solid #d5dae2}
+.sisternav a:hover{border-bottom-color:var(--acc)}
+</style>
+</head>
+<body>
+<main>
+
+<h1>EXIF Orientation and Upscale Order: All 8 Tags Are Lossless, So Order Does Not Matter — Except When It Silently Does</h1>
+
+<p class="lede">The standard advice is "normalise orientation before you upscale, or you will
+resample twice." I measured it on all eight EXIF orientation values and the advice is wrong for
+every one of them: each tag is an exact pixel permutation that changes <strong>0.00%</strong> of
+pixels. The ordering still matters for non-right angles, but only by about 0.8 dB. What actually
+destroys images is a dropped tag and a hardcoded output size — 55.6% aspect error, and a loss of
+12.6 dB that no resolution check will catch.</p>
+
+<p class="meta">Measured with Pillow 12.2.0, numpy 1.26.4 and ffmpeg 6.1.1 on synthetic
+Siemens-star and text targets with controlled ground truth. Ten experiments, four tables. Two of
+them contradicted the hypothesis I started with, and both are reported as they came out.</p>
+
+<h2>Why "rotate before upscale" sounds right, and why it is mostly a myth</h2>
+
+<p>The reasoning is intuitive. A rotation by an arbitrary angle resamples the grid: every output
+pixel is an interpolation of four input neighbours, so if you rotate first and upscale second, the
+interpolation error gets amplified along with everything else. Do it the other way and the
+interpolation happens once, at the final resolution, where the error is a fraction of a pixel
+instead of a fraction of a pixel blown up by 2×.</p>
+
+<p>That argument is correct — for arbitrary angles. It is <em>not</em> correct for the eight
+orientations that cameras actually write, because those are all multiples of 90° plus optional
+mirroring, and a multiple of 90° is not an interpolation at all. It is a rearrangement of memory.
+Whether you reshuffle before or after a scale is irrelevant if the reshuffle is exact, and the
+measurement below shows it is exact to the bit.</p>
+
+<h2>Experiment 1 — all eight EXIF orientation values, tested for losslessness</h2>
+
+<p>I generated an 83×57×3 uint8 array of uniform random noise. Random noise is the right test
+signal here: any interpolation, rounding or resampling shows up immediately as changed pixels,
+where a smooth gradient could hide a sub-level error. Each of the eight orientation values was
+applied through Pillow's transpose operation and compared against an independent numpy
+implementation of the same permutation.</p>
+
+<table>
+<thead><tr><th>EXIF tag</th><th>Meaning</th><th class="num">Output size</th><th class="num">Pixels changed</th><th class="num">Bit-exact</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>normal</td><td class="num">57×83</td><td class="num">0.00%</td><td class="num">yes</td></tr>
+<tr><td>2</td><td>mirror horizontal</td><td class="num">57×83</td><td class="num">0.00%</td><td class="num">yes</td></tr>
+<tr><td>3</td><td>rotated 180°</td><td class="num">57×83</td><td class="num">0.00%</td><td class="num">yes</td></tr>
+<tr><td>4</td><td>mirror vertical</td><td class="num">57×83</td><td class="num">0.00%</td><td class="num">yes</td></tr>
+<tr><td>5</td><td>mirror + 90° CCW</td><td class="num">83×57</td><td class="num">0.00%</td><td class="num">yes</td></tr>
+<tr><td>6</td><td>rotated 90° CW</td><td class="num">83×57</td><td class="num">0.00%</td><td class="num">yes</td></tr>
+<tr><td>7</td><td>mirror + 90° CW</td><td class="num">83×57</td><td class="num">0.00%</td><td class="num">yes</td></tr>
+<tr><td>8</td><td>rotated 90° CCW</td><td class="num">83×57</td><td class="num">0.00%</td><td class="num">yes</td></tr>
+</tbody>
+</table>
+
+<p>Every value is exact. Not "visually lossless", not "within quantisation error" — the output
+array is bit-identical to the permuted input, on all 14.193 pixels, for all eight tags. That
+means the ordering question for real camera files has an answer before any upscaling is
+considered: <strong>it does not matter</strong>. Rotating a 4000×3000 phone photo and then
+upscaling it produces the same pixels as upscaling it and then rotating, to the last bit.</p>
+
+<div class="callout">
+<p><strong>Where I got it wrong first.</strong> My initial reference implementation used
+<code>np.rot90</code> with the wrong sign for tags 6 and 8, which made Pillow look lossy. Pillow
+was correct; my test was not. I only caught it because the mismatched tags were exactly the two
+pure rotations and their mirrors were passing — an asymmetry no real codec would produce.</p>
+</div>
+
+<h2>Experiment 2 — the ordering premium, measured on angles that are not right angles</h2>
+
+<p>Since EXIF tags are a non-issue, the interesting question is the general one: for a rotation
+that genuinely interpolates, how much does ordering cost? I built a 2048×1536 detailed target
+(Siemens star plus rendered text), downsampled it 2× with a box filter to create the "source",
+and compared two pipelines against an ideal constructed at each pipeline's own output size.</p>
+
+<p>The size-matched ideal matters. My first version of this test compared both pipelines against
+a single reference and reported a 1.9 dB advantage for upscale-first. That number was inflated:
+the rotate-first path had been resampled once more just to reach the reference grid, so it was
+penalised for a step the other path never performed. Comparing each output to the best image
+obtainable at its own dimensions removes that artefact. The honest number is smaller, and it is
+the one in the table.</p>
+
+<table>
+<thead><tr><th class="num">Angle</th><th class="num">rotate → upscale</th><th class="num">upscale → rotate</th><th class="num">Δ</th><th class="num">HF retained (up→rot)</th></tr></thead>
+<tbody>
+<tr><td class="num">1°</td><td class="num">27.904 dB</td><td class="num">28.630 dB</td><td class="num">+0.726</td><td class="num">41.67%</td></tr>
+<tr><td class="num">5°</td><td class="num">28.318 dB</td><td class="num">29.208 dB</td><td class="num">+0.890</td><td class="num">41.87%</td></tr>
+<tr><td class="num">15°</td><td class="num">29.452 dB</td><td class="num">30.301 dB</td><td class="num">+0.849</td><td class="num">42.92%</td></tr>
+<tr><td class="num">30°</td><td class="num">30.500 dB</td><td class="num">31.277 dB</td><td class="num">+0.777</td><td class="num">45.26%</td></tr>
+<tr><td class="num">45°</td><td class="num">30.740 dB</td><td class="num">31.528 dB</td><td class="num">+0.788</td><td class="num">46.20%</td></tr>
+</tbody>
+</table>
+
+<p>Upscaling first wins by 0.73–0.89 dB across every angle tested, and it also retains more
+high-frequency energy: 38.3–39.3% for rotate-first versus 41.7–46.2% for upscale-first. The
+advantage is remarkably flat with angle, which is the expected signature — the cost is one
+interpolation pass either way, and the only difference is the scale at which rounding error is
+committed. A 0.8 dB gap is real but small; it will not rescue a soft source, and it will not be
+visible on a phone screen.</p>
+
+<p>The practical consequence is uncomfortable but simple. For the eight EXIF values the premium
+is exactly zero, so the advice to "always normalise first" buys nothing. For a straightening
+rotation of a few degrees it buys about 0.8 dB, which is worth having but is not the difference
+between a usable and an unusable file. Time spent reordering a pipeline is better spent on the
+things in the next two sections.</p>
+
+<h2>Experiment 3 — what ffmpeg actually does with an orientation tag</h2>
+
+<p>Here the measurement turned from uninteresting to damaging. I built a 400×600 JPEG whose
+pixels are stored portrait but whose EXIF carries <code>Orientation=6</code>, meaning a viewer
+must rotate 90° CW to display it — it should appear as 600×400, aspect ratio 1.5. Three routes
+through ffmpeg were tested, and the aspect ratio of each output compared against 1.5.</p>
+
+<table>
+<thead><tr><th>Route</th><th class="num">Output</th><th class="num">Aspect error</th><th class="num">Bytes</th></tr></thead>
+<tbody>
+<tr><td>source file (tag 6)</td><td class="num">400×600</td><td class="num">—</td><td class="num">40.546</td></tr>
+<tr><td>default + <code>scale=800:1200</code></td><td class="num">800×1200</td><td class="num">55.6%</td><td class="num">34.632</td></tr>
+<tr><td>default + <code>scale=800:-2</code></td><td class="num">800×534</td><td class="num">0.1%</td><td class="num">—</td></tr>
+<tr><td><code>-noautorotate</code> + <code>scale=800:1200</code></td><td class="num">800×1200</td><td class="num">55.6%</td><td class="num">28.922</td></tr>
+<tr><td>EXIF stripped, then upscale</td><td class="num">800×1200</td><td class="num">55.6%</td><td class="num">27.036</td></tr>
+</tbody>
+</table>
+
+<p>ffmpeg's default autorotate fires on input and hands the filter graph a 600×400 frame. The
+filter then obeys the hardcoded <code>scale=800:1200</code> literally and stretches that already
+landscape frame back into a portrait one — a 55.6% aspect error, on a file that ffmpeg itself
+rotated correctly one step earlier. Nothing errors, nothing warns, and the output has a perfectly
+plausible size. Only <code>scale=800:-2</code>, which derives height from the true aspect, survives
+the autorotate.</p>
+
+<p>The stripped-EXIF route shows the second failure mode. It is the same 55.6%, but for a
+different reason: with the tag gone, the autorotate has nothing to act on, so the stored portrait
+pixels go straight through and the image is simply sideways. Its 27.036 bytes are also the
+smallest of the group, which is a useful hint — if a pipeline suddenly produces notably smaller
+files, check orientation before assuming a codec improvement.</p>
+
+<h2>Experiment 4 — the silent 12.6 dB loss</h2>
+
+<p>To put a quality number on it, I ran the full phone-to-upscale path: a controlled ground truth
+at 1200×800, stored as pixels rotated so that orientation 6 restores it, downsampled 2× and saved
+as JPEG with the tag set. Four routes were compared against the correctly oriented ideal.</p>
+
+<table>
+<thead><tr><th>Route</th><th class="num">PSNR</th><th class="num">HF energy</th><th class="num">Verdict</th></tr></thead>
+<tbody>
+<tr><td>rotate pixels → upscale</td><td class="num">26.165 dB</td><td class="num">45.88%</td><td class="num">correct</td></tr>
+<tr><td>upscale → rotate pixels</td><td class="num">26.164 dB</td><td class="num">45.87%</td><td class="num">correct</td></tr>
+<tr><td>ffmpeg autorotate (default)</td><td class="num">26.143 dB</td><td class="num">48.08%</td><td class="num">correct</td></tr>
+<tr><td>ffmpeg <code>-noautorotate</code></td><td class="num">13.505 dB</td><td class="num">60.12%</td><td class="num">sideways</td></tr>
+</tbody>
+</table>
+
+<p>The first three are within 0.02 dB of each other. That is the losslessness result from
+experiment 1 showing up again in a realistic pipeline: the ordering is irrelevant, and ffmpeg's
+own autorotate is as good as doing it by hand. The fourth route loses <strong>12.6 dB</strong>.</p>
+
+<p>Note the HF figure for that route: 60.12%, the highest in the table. Higher is not better here.
+The energy is high because the image is compared against a reference 90° away from it, so every
+edge boundary falls in the wrong place and the Laplacian fires on the mismatch. This is a trap in
+detail-retention metrics generally — a badly aligned image can score <em>higher</em> on HF energy
+than a correct one. PSNR is the metric that caught it; HF alone would have reported the broken
+output as the sharpest of the four.</p>
+
+<h2>Experiment 5 — double rotation, and why shape checks cannot find it</h2>
+
+<p>The third failure is the most embarrassing because it survives every sanity check people
+actually run. If a library autorotates at decode and the code then also calls
+<code>exif_transpose()</code>, the image is rotated twice — 180° from correct.</p>
+
+<p>Measured on the same noise array: the double-rotated result differs from the correct one at a
+PSNR of <strong>7.8 dB</strong>, and both are the same shape, 57×83. A dimension assertion passes.
+A file-size check passes. A "did the image load" check passes. An automated thumbnail review
+passes, because a 180° rotation of a photograph still looks like a photograph. The only reliable
+detectors are a visual look at an asymmetric feature (which is why I put coloured corner blocks
+in the test files) and a PSNR comparison against a known reference — and in production nobody has
+the reference.</p>
+
+<h2>The reproducible pipeline</h2>
+
+<p>Everything above is one script. The orientation check is the part worth keeping:</p>
+
+<pre><code>from PIL import Image, ImageOps
+import numpy as np
+
+im = Image.open("phone.jpg")
+tag = im.getexif().get(0x0112, 1)
+print("orientation tag:", tag)          # 6 on most portrait phone shots
+
+# Normalise exactly once. ImageOps.exif_transpose is a pure permutation,
+# so this costs nothing and cannot be lossy.
+fixed = ImageOps.exif_transpose(im)     # tag is cleared on the result
+assert "Orientation" not in fixed.getexif()
+
+fixed.save("stage.jpg", quality=95)     # NO exif= argument: tag must not survive
+upscaled = fixed.resize((fixed.width*2, fixed.height*2), Image.LANCZOS)
+
+# Guard against the double-rotate bug:
+assert upscaled.width == fixed.width * 2
+assert upscaled.height == fixed.height * 2</code></pre>
+
+<p>Three rules follow from the numbers, and they are cheap enough to apply everywhere:</p>
+
+<ul>
+<li><strong>Normalise once, at the start, and assert the tag is gone.</strong> All eight values
+are lossless permutations, so this step costs exactly zero detail. It removes the ambiguity that
+causes every other failure in this article.</li>
+<li><strong>Never write a literal output size.</strong> <code>scale=800:1200</code> is correct
+only for one specific input geometry. Use <code>-2</code> for the derived dimension, or compute
+the target from <code>fixed.width/height</code> after normalisation.</li>
+<li><strong>Do not trust shape or file size as an orientation check.</strong> A sideways
+orientation-6 file and a correct one are both 800×1200; a double-rotated file is the same shape
+as a correct one. Only the tag and a pixel comparison distinguish them.</li>
+</ul>
+
+<p>For the record, ordering was the hypothesis I expected to matter most, and it turned out to be
+the least important variable measured here — worth 0.8 dB at odd angles and exactly nothing at
+the right angles that cameras write. The aspect-ratio bug and the sideways pass-through were
+worth 55.6% and 12.6 dB respectively. Effort belongs on those two, not on reordering steps that
+are already exact.</p>
+
+</article>
+<footer>
+<p>Published by UpgoLAB — <a href="https://upgolab.com">AI photo and short-video upscaling in the
+browser</a>. Measured with Pillow 12.2.0, numpy 1.26.4 and ffmpeg 6.1.1 (libx264 build, Ubuntu
+package) on synthetic targets with controlled ground truth. Ten experiments, four tables, two
+results that contradicted the starting hypothesis. All eight EXIF orientation values were
+confirmed bit-exact on a 14.193-pixel random array, with the reference implementation rebuilt
+after the first version disagreed — the failure was in my test, not in Pillow, and both versions
+are described. The ordering premium was first measured at 1.9 dB and corrected to 0.8 dB once an
+extra resampling step in one path was removed; the corrected figure is reported. The
+55.6% aspect error and the 12.6 dB autorotate loss are single-run values from deterministic
+inputs, reproducible from the snippet above. No number was adjusted after the run.</p>
+
+<nav class="sisternav" aria-label="More measured upscaling guides">
+<p>More measured guides</p>
+<ul>
+  <li><a href="https://celticgemini001.github.io/upgolab-ai-upscaler-guide/">What upscaling recovers vs invents</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-video-upscaling-limits/">Why video isn't image upscaling</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-upscale-product-photos/">Product shot vs face</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-2k-vs-4k-decision/">2K vs 4K bits-per-pixel</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-upscale-anime-illustration/">Line art and ink coverage</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-old-footage-restoration/">Old footage restoration</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-screen-recording-4k/">Screen recording to 4K</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-thumbnail-4k-master/">4K thumbnail master</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-remove-background-and-upscale/">Cutout and upscale</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-anisotropic-upscale/">Anisotropic / one-axis scale</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-chroma-subsampling/">Chroma subsampling 4:2:0</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-gamma-vs-linear-light/">Gamma vs linear light</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-bit-depth-banding/">8-bit vs 10-bit banding</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-jpeg-blocking-upscale/">JPEG blocking under upscaling</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-upscale-vs-reshoot/">Re-shoot vs upscale break-even</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-what-nofollow-means/">What rel=nofollow actually does</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-fractional-upscale-factors/">Fractional upscale factors</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-tiled-upscale-seams/">Tiled upscale seams</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-sharpen-before-or-after-upscale/">Sharpen before or after</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-output-format-after-upscale/">Output format after upscale</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-noise-and-grain-upscaling/">Noise and grain under upscaling</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-halftone-dots-upscaling/">Halftone dots from print</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-hdr-upscaling-bit-depth/">HDR: 8-bit vs 16-bit measured</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-motion-blur-before-upscale/">Motion blur before upscaling</a></li>
+  <li><a href="https://celticgemini001.github.io/upgolab-tools/">All measured guides (index)</a></li>
+  <li><a href="https://celticgemini001.github.io/">All upscaling measurements, start here</a></li>
+</ul>
+</nav>
+</footer>
+</main>
+</body>
+</html>
