@@ -69,7 +69,7 @@ destroys images is a dropped tag and a hardcoded output size — 55.6% aspect er
 12.6 dB that no resolution check will catch.</p>
 
 <p class="meta">Measured with Pillow 12.2.0, numpy 1.26.4 and ffmpeg 6.1.1 on synthetic
-Siemens-star and text targets with controlled ground truth. Ten experiments, four tables. Two of
+Siemens-star and text targets with controlled ground truth. Thirteen experiments, six tables. Three of
 them contradicted the hypothesis I started with, and both are reported as they came out.</p>
 
 <h2>Why "rotate before upscale" sounds right, and why it is mostly a myth</h2>
@@ -231,6 +231,124 @@ detectors are a visual look at an asymmetric feature (which is why I put coloure
 in the test files) and a PSNR comparison against a known reference — and in production nobody has
 the reference.</p>
 
+<h2>Experiment 6 — the export step is where orientation actually dies</h2>
+
+<p>Everything above rests on a precondition I never stated: the tag has to still be there when the
+file is read. Experiments 1–5 all opened a file that had just been written by the same process, so
+the tag was guaranteed present. Real pipelines break that guarantee at the export call, not at the
+decode call, and the failure is silent because the pixels are never touched.</p>
+
+<p>Two questions decide whether this matters. First, is the tag fragile in the formats people
+actually write? Second, if the tag is lost, what does that cost in pixels?</p>
+
+<h3>6.1 The tag itself is not fragile</h3>
+
+<p>I wrote all eight orientation values into four container formats and read them back: JPEG
+(quality 95), PNG, lossless WebP and TIFF. All <strong>eight values round-trip in all four
+formats</strong> — 32 of 32, eight distinct values read back per format, no collapse to
+orientation 1.</p>
+
+<table>
+<thead><tr><th>Format</th><th class="num">Values recovered</th><th class="num">Distinct</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>JPEG q95</td><td class="num">8/8</td><td class="num">8</td><td>tag survives</td></tr>
+<tr><td>PNG</td><td class="num">8/8</td><td class="num">8</td><td>tag survives</td></tr>
+<tr><td>WebP lossless</td><td class="num">8/8</td><td class="num">8</td><td>tag survives</td></tr>
+<tr><td>TIFF</td><td class="num">8/8</td><td class="num">8</td><td>tag survives</td></tr>
+</tbody>
+</table>
+
+<p>Storing the tag is also nearly free. A JPEG with no EXIF block at all was 3.104 bytes; writing
+any EXIF block with the orientation tag made it 3.140 bytes, a flat <strong>+36 bytes</strong>. The
+orientation value itself costs <strong>0 extra bytes</strong> — 274=1 and 274=6 produce byte-identical
+file sizes, because the value is a two-byte field inside a block that already exists. There is no
+size argument for dropping it.</p>
+
+<h3>6.2 The tag is lost by omission, not by codec</h3>
+
+<p>The way orientation dies is the ordinary "load, process, save" call where nobody propagates the
+EXIF block. Pillow does not carry it forward unless you pass it:</p>
+
+<pre><code>from PIL import Image
+
+src = Image.open("sideways.jpg")      # getexif()[274] == 6, size 96x64
+src.save("out.jpg", quality=95)       # no exif= argument
+# out.jpg: getexif().get(274) is None, size still 96x64
+
+import numpy as np
+from PIL import ImageOps
+# rendered as-is, compared to the correctly oriented reference:
+# 99.24% of pixels differ (coloured corner markers end up in the wrong corners)</code></pre>
+
+<p>That is the whole bug: <strong>tag dropped, pixels never rotated, 99.24% wrong, and the file
+size and dimensions are unchanged</strong>. Nothing about the output looks suspicious to a script.
+The aspect ratio is still 96×64 because nothing re-encoded the geometry — the picture is simply
+sideways now, permanently, with no tag left to say so.</p>
+
+<p>The control case confirms the fix is cheap: transposing before saving gives a 64×96 file, tag
+none, and a pixel mismatch of <strong>2.62%</strong> against the reference — that residue is just
+JPEG quantisation and the resample to the reference grid, not a geometry error. Order of operations
+does not matter here as long as exactly one of the two carries the rotation: either
+<code>exif_transpose()</code> and then save, or save and keep the tag.</p>
+
+<h3>6.3 ffmpeg autorotates by default, and strips the tag while doing it</h3>
+
+<p>ffmpeg 6.1.1 is the tool I recommended in the pipeline section, so I checked what it does to a
+tagged file rather than assuming. Default behaviour is correct: it applies the orientation at
+decode, writes upright pixels, and drops the tag because the tag is no longer needed.</p>
+
+<table>
+<thead><tr><th>Invocation</th><th class="num">Output size</th><th class="num">Tag after</th><th class="num">Pixel mismatch</th><th class="num">Aspect error</th></tr></thead>
+<tbody>
+<tr><td>default (autorotate on)</td><td class="num">64×96</td><td class="num">none</td><td class="num">1.53%</td><td class="num">0%</td></tr>
+<tr><td><code>-noautorotate</code> before <code>-i</code></td><td class="num">96×64</td><td class="num">none</td><td class="num">99.19%</td><td class="num">125%</td></tr>
+<tr><td>default + <code>scale=192:-2</code></td><td class="num">192×288</td><td class="num">none</td><td class="num">1.69%</td><td class="num">0%</td></tr>
+<tr><td><code>-noautorotate</code> + <code>scale=192:-2</code></td><td class="num">192×128</td><td class="num">none</td><td class="num">99.28%</td><td class="num">125%</td></tr>
+</tbody>
+</table>
+
+<p>Two practical notes came out of running this rather than reading the docs. <code>-noautorotate</code>
+is an <em>input</em> option: placing it after <code>-i</code> makes ffmpeg exit 234 with
+"cannot be applied to output url" and write no file at all — a hard failure, which at least is
+honest. And the aspect error is exactly the 125% figure: a 0.667 true ratio becomes 1.500, the
+portrait shot becomes a landscape one, and <code>scale=192:-2</code> faithfully preserves the wrong
+shape because <code>-2</code> derives only the height it was told to derive.</p>
+
+<h3>6.4 A result that was my own error</h3>
+
+<p>My first run of this experiment reported a 99.58% mismatch for ffmpeg's default path, which
+would have meant ffmpeg was mangling orientation. It was not. My fixture had been built with
+<code>REF.transpose(Image.ROTATE_270)</code> as the stored orientation for tag 6, and the sign was
+wrong — the correct stored pixels for tag 6 are <code>ROTATE_90</code>.</p>
+
+<p>The fix was to stop trusting my own fixture and add a gate to the test: a file is only a valid
+orientation-6 fixture if <code>ImageOps.exif_transpose()</code> on it reproduces the reference. That
+is not the tool under test, it is the definition of what an EXIF-aware reader is supposed to do, so
+it makes a clean oracle. With the gate in place, three of the four candidate stored orientations
+failed it (99.58%, 99.20%, 92.30%) and only <code>ROTATE_90</code> passed at 1.53%. Every number in
+the table above comes from the gated fixture. The earlier 99.58% is in this article because it is
+the exact error this whole page is about — a check that looked like a tool bug and was actually a
+sign error in the test.</p>
+
+<h3>6.5 What this changes about the advice</h3>
+
+<p>It sharpens it, and it moves the emphasis. The ordering question that experiments 2–4 spent most
+of their effort on is worth 0.73–0.89 dB at odd angles and nothing at the right angles cameras
+actually write. The export question is worth <strong>99% of the pixels, permanently</strong>, and it
+is decided by one keyword argument that most code does not pass.</p>
+
+<ul>
+<li><strong>Assert the tag state you intend, on the output.</strong> Either the output has no tag
+and upright pixels, or it has a tag and stored pixels. Having neither is the failure mode, and it
+trips no dimension check.</li>
+<li><strong>Pass the EXIF block explicitly when it must survive.</strong> <code>save(..., exif=...)</code>
+for Pillow, <code>-map_metadata 0</code> or <code>copy_metadata</code> in ffmpeg. The default for a
+fresh <code>save()</code> is to drop it.</li>
+<li><strong>Gate any orientation test on a reference library.</strong> The bug I hit — a wrong
+transpose sign in the fixture — produces results indistinguishable from a real library bug. If the
+test and the tool disagree, rebuild the fixture before touching the tool.</li>
+</ul>
+
 <h2>The reproducible pipeline</h2>
 
 <p>Everything above is one script. The orientation check is the part worth keeping:</p>
@@ -278,7 +396,7 @@ are already exact.</p>
 <footer>
 <p>Published by UpgoLAB — <a href="https://upgolab.com">AI photo and short-video upscaling in the
 browser</a>. Measured with Pillow 12.2.0, numpy 1.26.4 and ffmpeg 6.1.1 (libx264 build, Ubuntu
-package) on synthetic targets with controlled ground truth. Ten experiments, four tables, two
+package) on synthetic targets with controlled ground truth. Thirteen experiments, six tables, three
 results that contradicted the starting hypothesis. All eight EXIF orientation values were
 confirmed bit-exact on a 14.193-pixel random array, with the reference implementation rebuilt
 after the first version disagreed — the failure was in my test, not in Pillow, and both versions
