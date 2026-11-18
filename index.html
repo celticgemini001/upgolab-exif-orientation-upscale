@@ -69,7 +69,7 @@ destroys images is a dropped tag and a hardcoded output size — 55.6% aspect er
 12.6 dB that no resolution check will catch.</p>
 
 <p class="meta">Measured with Pillow 12.2.0, numpy 1.26.4 and ffmpeg 6.1.1 on synthetic
-Siemens-star and text targets with controlled ground truth. Eleven experiments, six tables. Three of
+Siemens-star and text targets with controlled ground truth. Twelve experiments, nine tables. Four of
 them contradicted the hypothesis I started with, and all are reported as they came out.</p>
 
 <h2>Why "rotate before upscale" sounds right, and why it is mostly a myth</h2>
@@ -392,12 +392,193 @@ the right angles that cameras write. The aspect-ratio bug and the sideways pass-
 worth 55.6% and 12.6 dB respectively. Effort belongs on those two, not on reordering steps that
 are already exact.</p>
 
+<h2>Experiment 7 — video does not use EXIF, and that changes every number above</h2>
+
+<p>Everything so far assumed the rotation is stored as a tag in the file's metadata block, sitting
+next to the pixels. Video does not work that way. An MP4 carries the rotation as a
+<strong>display matrix</strong> in the track header — a 3×3 transform in the <code>tkhd</code>
+atom — and every player is expected to apply it at draw time. That single structural difference
+invalidates the most reassuring result on this page. In stills, a dropped tag leaves the pixels
+untouched and the picture merely sideways. In video, "sideways" is only the beginning, because
+almost every downstream tool <em>also</em> filters by resolution, and the resolution it reads is
+the stored one, not the displayed one.</p>
+
+<p>I rebuilt the fixture for the video case: a 1080×1920 portrait frame with asymmetric corner
+markers (red top-left, blue top-right, green bottom-left, yellow bottom-right) and a noisy band,
+stored as a 1920×1080 landscape with a display matrix of −90. The dead giveaway that the fixture
+is correct is that ffmpeg's default decode reproduces the reference at 24.83 dB — and if the
+matrix sign is wrong, it does not reproduce it at all. That gate caught a sign error in my first
+attempt, exactly like the one in section 6.4.</p>
+
+<h3>7.1 The rotation is a bit-exact permutation, same as EXIF</h3>
+
+<p>The first question is whether the video rotation is lossy, and it is not. Decoding with ffmpeg's
+default autorotate and decoding with autorotate disabled plus an explicit <code>transpose=1</code>
+produce <strong>bit-identical output</strong> — PSNR infinite, 0.0% of pixels differing by more
+than 8 levels, on all 2.073.600 pixels. The right-angle transpose is a memory reshuffle in video
+for the same reason it is in stills: no interpolation is involved, so there is nothing to lose.</p>
+
+<p>The mirror case is where it gets dangerous. Using <code>transpose=2</code>, which rotates the
+other way, gives an image of <strong>identical dimensions</strong> — still 1080×1920 — with a
+PSNR of <strong>20.38 dB</strong> against the correct decode, and <strong>71.0%</strong> of pixels
+differing by more than 8 levels. Every shape assertion passes. And the high-frequency energy is
+<strong>35.27 for both</strong>, identical to two decimal places: the wrong-direction image is not
+measurably softer or sharper, so no sharpness metric flags it either. A 90° error in the wrong
+direction is the one orientation bug that no automated check catches, because the bounding box is
+untouched.</p>
+
+<h3>7.2 A double rotation now changes the bounding box — the opposite of the still case</h3>
+
+<p>Section 6.5 warned that a double-rotated still keeps its shape, so dimensions are useless as a
+check. For video with a display matrix the situation flips, and the flip is itself a trap. When the
+matrix is applied at decode and the filter chain then rotates again, the frame comes out
+<strong>1920×1080</strong> instead of 1080×1920 — the bounding box is now wrong, which means a
+dimension check <em>does</em> fire. But a pipeline that rewraps to 1080-wide outputs and never
+compares against the source sees nothing unusual. Measured against the correct frame resized to the
+same box, the double-rotated result is 18.07 dB with 70.8% of pixels off.</p>
+
+<p>With a 180° matrix there is no shape change at all, and the check goes blind again. The corrupt
+output is 1080×1920, identical to the correct one, at <strong>20.38 dB</strong> with
+<strong>71.0%</strong> of pixels differing. This is the same failure section 6.5 described for
+stills, reproduced independently in a different container using a completely different metadata
+mechanism — which is a good sign the underlying problem is structural and not a Pillow quirk.</p>
+
+<h3>7.3 The container decides whether the rotation survives</h3>
+
+<p>Whether the display matrix is carried depends entirely on the container, and one format that
+people use specifically for stream processing silently drops it. Copying the same tagged stream
+through six containers:</p>
+
+<table>
+<thead><tr><th>Container</th><th>Stored</th><th>rotation</th><th>Displayed</th><th>Recoverable?</th></tr></thead>
+<tbody>
+<tr><td>MP4 (<code>-c copy</code>)</td><td>1920×1080</td><td>−90</td><td>1080×1920</td><td>yes, exact</td></tr>
+<tr><td>MOV (<code>-c copy</code>)</td><td>1920×1080</td><td>−90</td><td>1080×1920</td><td>yes, exact</td></tr>
+<tr><td>MKV (<code>-c copy</code>)</td><td>1920×1080</td><td>−90</td><td>1080×1920</td><td>yes, exact</td></tr>
+<tr><td>M4V (<code>-c copy</code>)</td><td>1920×1080</td><td>−90</td><td>1080×1920</td><td>yes, exact</td></tr>
+<tr><td><strong>MPEG-TS</strong> (<code>-c copy</code>)</td><td>1920×1080</td><td><strong>none</strong></td><td><strong>1920×1080</strong></td><td>only by luck</td></tr>
+<tr><td>WebM (VP9 re-encode)</td><td>1080×1920</td><td>none</td><td>1080×1920</td><td>rotation baked in</td></tr>
+</tbody>
+</table>
+
+<p>MPEG-TS has no place to put the matrix, so the tag is gone and the stream is handed on as a
+landscape 1920×1080 that is actually a portrait frame lying on its side. The pixels are still
+perfect — rotating the TS frame back 90° recovers the reference at <strong>24.83 dB</strong>,
+identical to the untouched source — but nothing in the file says it needs rotating. A downstream
+consumer that trusts the header will stretch it to portrait, and that costs <strong>17.57 dB</strong>
+with 71.9% of pixels wrong. The information is not lost, but it is no longer in the file; it is in
+whoever remembers.</p>
+
+<p>WebM is the honest opposite: libvpx-vp9 bakes the rotation into the pixels on re-encode, so the
+output needs no matrix and displays at 1080×1920 with no tag. It is the only format in the table
+where the geometry can be recovered from the header alone without trusting a matrix. The cost is a
+re-encode — 750.602 bytes versus 953.900 for the copy — which is the trade you are making.</p>
+
+<h3>7.4 The resolution gate is where the pixels actually die</h3>
+
+<p>Here is the failure that costs far more than the ordering question this page opened with. A
+tagged portrait file reports <code>height=1080</code> in its stream header, because that is the
+stored geometry. A quality gate or a "make it HD" step that asks for 1080 looks at that number,
+sees it is already satisfied, and — worse — a scale target of <code>-2:1080</code> is interpreted
+against the stored frame. Measured on the same tagged file:</p>
+
+<table>
+<thead><tr><th>Route</th><th>Output</th><th>Pixels</th><th>% of true area</th><th>Aspect error</th></tr></thead>
+<tbody>
+<tr><td><code>scale=-2:1080</code> ("make it 1080p")</td><td><strong>608×1080</strong></td><td>656.640</td><td><strong>31.7%</strong></td><td>+0.1% (passes)</td></tr>
+<tr><td><code>scale=-2:720</code></td><td>406×720</td><td>292.320</td><td>14.1%</td><td>+0.2% (passes)</td></tr>
+<tr><td><code>scale=1080:-2</code> (width-based)</td><td>1080×1920</td><td>2.073.600</td><td>100.0%</td><td>0.0%</td></tr>
+<tr><td>passthrough (no filter)</td><td>1080×1920</td><td>2.073.600</td><td>100.0%</td><td>0.0%</td></tr>
+<tr><td><code>scale=-2:1080 -noautorotate</code></td><td>1920×1080</td><td>2.073.600</td><td>100.0%</td><td><strong>+216%</strong></td></tr>
+</tbody>
+</table>
+
+<p>The first row is the one to sit with. Asking ffmpeg to make the clip 1080 tall produces a
+<strong>608×1080</strong> file — <strong>31.7% of the true pixel area</strong>, a 1.78× linear
+downscale — and the aspect ratio is <em>correct</em>, 0.5630 against a true 0.5625. So the aspect
+check passes, the "is it 1080p" check passes, the file plays, and it looks like a normal portrait
+video. The only thing wrong is that two thirds of the pixels are missing. Compared against the
+correct image at the same output size, the result is 31.57 dB with 38.5% of pixels differing by
+more than 8 levels — the loss is entirely a resample, not a geometry error, which is exactly why
+it evades every geometric assertion.</p>
+
+<p>The rule that falls out is narrow and absolute: <strong>derive the other dimension from the
+axis you actually know</strong>. If the frame is portrait after rotation, constrain its height —
+<code>scale=1080:-2</code>, not <code>-2:1080</code>. The <code>-2</code> placeholder preserves
+aspect but it does not know which axis you care about, and on an autorotated frame the axis you fed
+it is the stored one.</p>
+
+<p>Notice also that <code>scale=-2:1080</code> and <code>scale=-2:720</code> both have correct
+aspect to within 0.2%. Aspect preservation and resolution preservation are independent properties,
+and this is a case where the first is fully satisfied while the second is 68% violated.</p>
+
+<h3>7.5 The matrix itself is free — the failure is always downstream</h3>
+
+<p>One last measurement, because it kills the argument for stripping the tag to save bytes. The
+1080×1920 fixture with and without a display matrix: both <strong>953.900 bytes</strong>. Exactly
+<strong>five</strong> bytes differ in the whole 953.900-byte file, all of them inside the 92-byte
+<code>tkhd</code> atom, all of them matrix coefficients. The rotation costs <strong>zero bytes</strong>;
+it is a rewrite of fields that already exist, not an appended block. The 180° file is the same
+story: 974.473 bytes with the matrix, 974.473 without, four bytes apart.</p>
+
+<p>So the accounting is completely one-sided. Keeping the matrix costs nothing. Dropping it costs
+either 216% aspect error, or 68% of the pixels, or — in the case where you remember to rotate
+manually anyway — nothing at all. There is no storage argument, no quality argument, and no speed
+argument for removing it. The only reason it ever disappears is that a tool did not know it was
+there, and the containers in section 7.3 are where that happens.</p>
+
+<h3>7.6 What carries over from the still-image case, and what does not</h3>
+
+<table>
+<thead><tr><th>Property</th><th>Still (EXIF tag)</th><th>Video (display matrix)</th></tr></thead>
+<tbody>
+<tr><td>Right-angle rotation lossless</td><td>yes, 8/8 tags bit-exact</td><td>yes, PSNR infinite</td></tr>
+<tr><td>Ordering (rotate vs scale) matters</td><td>no at 90°, 0.8 dB at odd angles</td><td>no, bit-identical at 90°</td></tr>
+<tr><td>Double rotation changes shape</td><td><strong>no</strong> (180°, 7.8 dB)</td><td>90°: yes (1920×1080) · 180°: <strong>no</strong> (20.38 dB)</td></tr>
+<tr><td>Wrong direction is detectable by shape</td><td>no</td><td>no (same box, 20.38 dB, same HF)</td></tr>
+<tr><td>Tag survives all common containers</td><td>yes, 4/4 formats</td><td><strong>no</strong> — MPEG-TS drops it</td></tr>
+<tr><td>Storing it costs bytes</td><td>+36 bytes flat</td><td><strong>0 bytes</strong></td></tr>
+</tbody>
+</table>
+
+<p>The rows that differ are the interesting ones. The permutation being lossless is a property of
+90° arithmetic and holds everywhere. Whether the metadata survives is a property of the container,
+and video containers are far more varied than image formats. And the resolution-gate failure in
+7.4 does not exist in the still case at all, because deciding an output size for a still almost
+always goes through the library's own dimensions after transpose, whereas a video pipeline hands a
+filter graph a target string and a stored frame.</p>
+
+<p>The practical checklist for video, in order of what the measurements say is worth doing:</p>
+
+<ul>
+<li><strong>Probe the displayed size, not the stream size.</strong> Read the rotation side data
+before any decision. <code>ffprobe -show_streams -show_entries stream_side_data=rotation</code>
+and swap the axes yourself if it is ±90.</li>
+<li><strong>Never size by the axis that could be the rotated one.</strong> On a portrait clip,
+use <code>scale=W:-2</code>, where W is the width after rotation. <code>-2:H</code> is a
+downscale of the stored landscape.</li>
+<li><strong>Do not pass tagged video through MPEG-TS</strong> unless you are re-attaching the
+rotation at the other end. The pixels survive; the instruction does not.</li>
+<li><strong>Check the corner markers.</strong> A pixel comparison against a known reference is the
+only check that caught the wrong-direction transpose at 20.38 dB with identical HF energy and an
+identical bounding box. Coloured, asymmetric corners make a 180° or wrong-sign error visible at a
+glance; a photograph does not.</li>
+</ul>
+
+<p>For scale: the ordering premium this page spent four experiments on is 0.8 dB at odd angles and
+zero at right angles. The resolution gate is 68% of the pixels, silently, with a correct aspect
+ratio and a passing dimension check. Only one of the two needs a reviewer to notice it, and it is
+not the one that got the most attention.</p>
+
 </article>
 <footer>
 <p>Published by UpgoLAB — <a href="https://upgolab.com">AI photo and short-video upscaling in the
 browser</a>. Measured with Pillow 12.2.0, numpy 1.26.4 and ffmpeg 6.1.1 (libx264 build, Ubuntu
-package) on synthetic targets with controlled ground truth. Eleven experiments, six tables, three
-results that contradicted the starting hypothesis. All eight EXIF orientation values were
+package) on synthetic targets with controlled ground truth. Twelve experiments, nine tables, four
+results that contradicted the starting hypothesis. The video section uses a 1080×1920 portrait fixture
+stored as 1920×1080 with a −90 display matrix, gated on the reference being reproduced at 24.83 dB
+before any number was recorded — the first attempt failed that gate on a sign error in the fixture
+and was rebuilt, exactly as in section 6.4. All eight EXIF orientation values were
 confirmed bit-exact on a 14.193-pixel random array, with the reference implementation rebuilt
 after the first version disagreed — the failure was in my test, not in Pillow, and both versions
 are described. The ordering premium was first measured at 1.9 dB and corrected to 0.8 dB once an
